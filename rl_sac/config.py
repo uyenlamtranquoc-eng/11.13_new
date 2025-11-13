@@ -12,8 +12,6 @@ class RewardWeights:
     wait: float = 0.4
     smooth: float = 0.1
     throughput: float = 1.0
-    green_phase_bonus: float = 0.3
-    red_phase_wait: float = 0.3
 
 
 @dataclass
@@ -23,12 +21,12 @@ class EnvConfig:
     sumo_gui_binary: str = "sumo-gui"
     host: str = "127.0.0.1"
     port: int = 8873
-    step_length: float = 1.0
-    max_steps: int = 3600
+    step_length: float = 3.0
+    max_steps: int = 1200
     warmup_steps: int = 120
     action_low: float = 5.0
     action_high: float = 15.0
-    max_speed_delta: float = 1.5  # m/s per control step
+    max_speed_delta: float = 4.5  # m/s per control step (keeps ~1.5 m/s^2 with 3s steps)
     cav_type_ids: Sequence[str] = ("cav",)
     controlled_lanes_e2w: Sequence[str] = (
         "E_J2_1",
@@ -57,8 +55,8 @@ class EnvConfig:
     mainline_green_phases: Sequence[int] = (0, 4)
     mainline_yellow_phases: Sequence[int] = (1, 3, 5, 7)
     phase_speed_scale_green: float = 1.0
-    phase_speed_scale_yellow: float = 1.0
-    phase_speed_scale_red: float = 1.0
+    phase_speed_scale_yellow: float = 0.85
+    phase_speed_scale_red: float = 0.6
     reward_weights: RewardWeights = field(default_factory=RewardWeights)
     seed: int = 7
 
@@ -80,7 +78,7 @@ class SACConfig:
     target_entropy_scale: float = 0.98
     grad_steps_per_update: int = 1
     start_random_steps: int = 900
-    update_after: int = 3000
+    update_after: int = 12000
     update_every: int = 1
     alpha_init: float = 0.2
     normalize_rewards: bool = False
@@ -92,7 +90,7 @@ class TrainConfig:
     env: EnvConfig = field(default_factory=EnvConfig)
     sac: SACConfig = field(default_factory=SACConfig)
     total_episodes: int = 120
-    max_episode_steps: int = 3600
+    max_episode_steps: int = 1200
     eval_interval: int = 10
     model_dir: Path = Path("artifacts/models")
     run_dir: Path = Path("artifacts/runs")

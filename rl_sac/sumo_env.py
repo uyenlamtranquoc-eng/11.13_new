@@ -353,10 +353,7 @@ class CavSpeedEnv:
         phase_idx = self._current_phase_index()
         is_green = phase_idx in cfg.mainline_green_phases
         is_yellow = phase_idx in cfg.mainline_yellow_phases
-        is_red = not (is_green or is_yellow)
-        red_queue_ratio = queue_ratio if is_red else 0.0
-        red_wait_norm = wait_norm if is_red else 0.0
-        green_throughput_norm = throughput_norm if is_green else 0.0
+        red_queue_ratio = queue_ratio if (not is_green and not is_yellow) else 0.0
 
         reward = (
             -weights.energy * energy_norm
@@ -364,9 +361,7 @@ class CavSpeedEnv:
             -weights.wait * wait_norm
             -weights.smooth * smooth
             +weights.throughput * throughput_norm
-            +weights.green_phase_bonus * green_throughput_norm
-            -weights.red_phase_wait * red_wait_norm
-            -weights.red_phase_wait * red_queue_ratio
+            -0.3 * red_queue_ratio
         )
         terms = {
             "energy": energy,
@@ -379,8 +374,6 @@ class CavSpeedEnv:
             "throughput": float(arrived_delta),
             "throughput_norm": throughput_norm,
             "red_queue_ratio": float(red_queue_ratio),
-            "red_wait_norm": red_wait_norm,
-            "green_throughput_norm": green_throughput_norm,
             "reward": reward,
         }
         self._last_energy = energy

@@ -96,8 +96,6 @@ def train() -> None:
         "mean_wait_norm",
         "mean_throughput_norm",
         "mean_red_queue_ratio",
-        "mean_green_throughput_norm",
-        "mean_red_wait_norm",
         "q1_loss",
         "actor_loss",
         "alpha",
@@ -121,8 +119,6 @@ def train() -> None:
             throughput_norm_sum = 0.0
             wait_norm_sum = 0.0
             red_queue_ratio_sum = 0.0
-            green_throughput_norm_sum = 0.0
-            red_wait_norm_sum = 0.0
             step_count = 0
             for t in range(config.max_episode_steps):
                 if global_step < config.sac.start_random_steps:
@@ -149,8 +145,6 @@ def train() -> None:
                 throughput_norm_sum += info.get("throughput_norm", 0.0)
                 wait_norm_sum += info.get("wait_norm", 0.0)
                 red_queue_ratio_sum += info.get("red_queue_ratio", 0.0)
-                green_throughput_norm_sum += info.get("green_throughput_norm", 0.0)
-                red_wait_norm_sum += info.get("red_wait_norm", 0.0)
 
                 if global_step >= config.sac.update_after and global_step % config.sac.update_every == 0:
                     stats = agent.update(buffer)
@@ -167,8 +161,6 @@ def train() -> None:
             mean_throughput_norm = 0.0
             mean_wait_norm = 0.0
             mean_red_queue_ratio = 0.0
-            mean_green_throughput_norm = 0.0
-            mean_red_wait_norm = 0.0
             if step_count:
                 inv_steps = 1.0 / step_count
                 mean_energy = energy_raw_sum * inv_steps
@@ -178,8 +170,6 @@ def train() -> None:
                 mean_throughput_norm = throughput_norm_sum * inv_steps
                 mean_wait_norm = wait_norm_sum * inv_steps
                 mean_red_queue_ratio = red_queue_ratio_sum * inv_steps
-                mean_green_throughput_norm = green_throughput_norm_sum * inv_steps
-                mean_red_wait_norm = red_wait_norm_sum * inv_steps
                 logger.log("energy", mean_energy)
                 logger.log("energy_norm", mean_energy_norm)
                 logger.log("queue", mean_queue)
@@ -187,8 +177,6 @@ def train() -> None:
                 logger.log("throughput_norm", mean_throughput_norm)
                 logger.log("wait_norm", mean_wait_norm)
                 logger.log("red_queue_ratio", mean_red_queue_ratio)
-                logger.log("green_throughput_norm", mean_green_throughput_norm)
-                logger.log("red_wait_norm", mean_red_wait_norm)
             logger.log("episode_reward", episode_reward)
             if episode % config.eval_interval == 0:
                 eval_stats = evaluate(agent, eval_env, episodes=2)
@@ -215,8 +203,6 @@ def train() -> None:
                     "mean_wait_norm": mean_wait_norm,
                     "mean_throughput_norm": mean_throughput_norm,
                     "mean_red_queue_ratio": mean_red_queue_ratio,
-                    "mean_green_throughput_norm": mean_green_throughput_norm,
-                    "mean_red_wait_norm": mean_red_wait_norm,
                     "q1_loss": summary.get("q1_loss", 0.0),
                     "actor_loss": summary.get("actor_loss", 0.0),
                     "alpha": summary.get("alpha", 0.0),
