@@ -1,4 +1,4 @@
-from __future__ import annotations
+ï»¿from __future__ import annotations
 
 import argparse
 from pathlib import Path
@@ -52,7 +52,7 @@ def main() -> None:
         queues.append(ep_queue / max(steps, 1))
         print(f"Episode {ep+1}: reward={ep_reward:.2f}, energy={energies[-1]:.3f}, queue={queues[-1]:.2f}")
 
-    print("Summary -> reward: {:.2f}¡À{:.2f}, energy: {:.3f}, queue: {:.2f}".format(
+    print("Summary -> reward: {:.2f}+/-{:.2f}, energy: {:.3f}, queue: {:.2f}".format(
         np.mean(rewards), np.std(rewards), np.mean(energies), np.mean(queues)
     ))
     env.close()
@@ -60,3 +60,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -6,6 +6,7 @@ import subprocess
 import sys
 from collections import deque
 from dataclasses import asdict
+from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
@@ -53,6 +54,14 @@ class CavSpeedEnv:
         self._lane_target_speeds = np.full(len(self.config.controlled_lanes), self.config.action_high, dtype=np.float32)
         self._prev_speed_targets = self._lane_target_speeds.copy()
         self._last_phase_index = 0
+        self._episode_idx = 0
+        self._cumulative_energy_kwh = 0.0
+        self._cumulative_wait_all = 0.0
+        self._cumulative_queue_all = 0.0
+        self._phase_color_ids = {"green": 0, "yellow": 1, "red": 2}
+        self._last_phase_color = "green"
+        self._last_phase_remaining = 0.0
+        self._episode_tag = "ep00000"
 
     # ------------------------------ properties -----------------------------
 
@@ -68,8 +77,8 @@ class CavSpeedEnv:
     def _frame_dim(self) -> int:
         per_lane = len(self.config.controlled_lanes) * self.frame_features_per_lane
         # plus corridor-level stats (3), mean corridor speed (1), progress (1),
-        # phase one-hot (phase_bins) and phase progress (1)
-        return per_lane + 5 + self.config.phase_bins + 1
+        # phase one-hot (phase_bins) and phase progress + remaining (2)
+        return per_lane + 5 + self.config.phase_bins + 2
 
     @property
     def observation_dim(self) -> int:
@@ -81,6 +90,13 @@ class CavSpeedEnv:
         self.close()
         if seed is not None:
             self._rng.seed(seed)
+        self._episode_idx += 1
+        self._episode_tag = f"ep{self._episode_idx:05d}"
+        self._cumulative_energy_kwh = 0.0
+        self._cumulative_wait_all = 0.0
+        self._cumulative_queue_all = 0.0
+        self._last_phase_color = "green"
+        self._last_phase_remaining = 0.0
         self._start_traci()
         self._step = 0
         self._last_actions = np.zeros(self.action_dim, dtype=np.float32)
@@ -107,6 +123,8 @@ class CavSpeedEnv:
             "step": float(self._step),
             "mean_action_speed": float(applied_speeds.mean()) if len(applied_speeds) else 0.0,
             "phase_bin": float(self._phase_bin()),
+            "phase_color_id": float(self._phase_color_ids.get(self._last_phase_color, -1)),
+            "phase_remaining": self._last_phase_remaining,
         }
         self._last_actions = clipped
         return obs, reward, done, info
@@ -151,6 +169,7 @@ class CavSpeedEnv:
         cmd += ["--duration-log.disable", "true"]
         cmd += ["--log", "NUL"] if os.name == "nt" else ["--log", "/dev/null"]
         cmd += ["--error-log", "NUL"] if os.name == "nt" else ["--error-log", "/dev/null"]
+        self._append_output_args(cmd)
         label = f"cav-sac-{cfg.port}"
         self._conn_label = label
         if self._using_libsumo:
@@ -183,6 +202,42 @@ class CavSpeedEnv:
         for _ in range(self.config.warmup_steps):
             self._conn.simulationStep()
 
+    def _append_output_args(self, cmd: List[str]) -> None:
+        queue_dir = self._maybe_output_dir(self.config.queue_output_dir, "queue")
+        tripinfo_dir = self._maybe_output_dir(self.config.tripinfo_output_dir, "tripinfo")
+        fcd_dir = self._maybe_output_dir(self.config.fcd_output_dir, "fcd")
+        summary_dir = self._maybe_output_dir(self.config.summary_output_dir, "summary")
+        queue_path = self._resolve_output_path(queue_dir, "queue")
+        tripinfo_path = self._resolve_output_path(tripinfo_dir, "tripinfo")
+        fcd_path = self._resolve_output_path(fcd_dir, "fcd")
+        summary_path = self._resolve_output_path(summary_dir, "summary")
+        if queue_path:
+            cmd += ["--queue-output", queue_path]
+        if tripinfo_path:
+            cmd += ["--tripinfo-output", tripinfo_path]
+        if fcd_path:
+            cmd += ["--fcd-output", fcd_path]
+        if summary_path:
+            cmd += ["--summary-output", summary_path]
+
+    def _maybe_output_dir(self, configured: Path | None, default_name: str) -> Path | None:
+        if configured is not None:
+            return Path(configured)
+        if self.config.sumo_output_root is None:
+            return None
+        return Path(self.config.sumo_output_root) / default_name
+
+    def _resolve_output_path(self, base: Path | None, prefix: str, extension: str = ".xml") -> str | None:
+        if base is None:
+            return None
+        base_path = Path(base)
+        if base_path.suffix:
+            target = base_path
+        else:
+            target = base_path / f"{prefix}_{self._episode_tag}{extension}"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        return str(target)
+
     # -------------------------- observation helpers ------------------------
 
     def _prime_history(self) -> None:
@@ -202,7 +257,7 @@ class CavSpeedEnv:
         total_wait = 0.0
         queue_veh = 0
         cfg = self.config
-        phase_one_hot, phase_progress, phase_idx = self._phase_features()
+        phase_one_hot, phase_progress, phase_idx, phase_remaining = self._phase_features()
         for idx, lane_id in enumerate(cfg.controlled_lanes):
             vehicles = self._conn.lane.getLastStepVehicleIDs(lane_id)
             len_lane = self._lane_lengths.get(lane_id, 1.0)
@@ -217,14 +272,14 @@ class CavSpeedEnv:
             total_cav += cav_count
             total_flow += len(vehicles)
             total_wait += sum(waits)
-            halting = self._count_halting(vehicles)
-            queue_veh += halting
+            _, total_halt = self._count_halting(vehicles)
+            queue_veh += total_halt
             capacity = self._lane_capacities.get(lane_id, max(len_lane / max(cfg.density_headway, 1.0), 1.0))
             density = min(len(vehicles) / max(capacity, 1.0), 1.0)
             cav_share = cav_count / max(len(vehicles), 1)
             mean_speed = (sum(speeds) / len(speeds)) if speeds else 0.0
             wait_avg = (sum(waits) / len(waits)) if waits else 0.0
-            halting_ratio = halting / max(len(vehicles), 1)
+            halting_ratio = total_halt / max(len(vehicles), 1)
             lane_metrics.extend([
                 density,
                 cav_share,
@@ -236,6 +291,7 @@ class CavSpeedEnv:
         throughput = float(self._conn.simulation.getArrivedNumber())
         progress = self._step / max(self.config.max_steps, 1)
         corridor_speed = self._mean_corridor_speed()
+        remaining_norm = min(phase_remaining / max(cfg.phase_cycle, cfg.step_length), 1.0)
         features = (
             lane_metrics
             + [
@@ -246,7 +302,7 @@ class CavSpeedEnv:
             ]
             + [progress]
             + phase_one_hot.tolist()
-            + [phase_progress]
+            + [phase_progress, remaining_norm]
         )
         return np.array(features, dtype=np.float32)
 
@@ -258,12 +314,13 @@ class CavSpeedEnv:
         except traci.TraCIException:
             return 0
 
-    def _phase_features(self) -> Tuple[np.ndarray, float, int]:
+    def _phase_features(self) -> Tuple[np.ndarray, float, int, float]:
         cfg = self.config
         phase_idx = self._current_phase_index()
         one_hot = np.zeros(cfg.phase_bins, dtype=np.float32)
         one_hot[min(phase_idx, cfg.phase_bins - 1)] = 1.0
         progress = 0.0
+        remaining = 0.0
         if self._conn is not None:
             try:
                 duration = max(self._conn.trafficlight.getPhaseDuration(cfg.phase_signal_id), cfg.step_length)
@@ -273,7 +330,16 @@ class CavSpeedEnv:
                 progress = 1.0 - min(remaining / duration, 1.0)
             except traci.TraCIException:
                 progress = 0.0
-        return one_hot, progress, phase_idx
+        self._last_phase_remaining = remaining
+        return one_hot, progress, phase_idx, remaining
+
+    def _phase_category(self, phase_idx: int) -> str:
+        cfg = self.config
+        if phase_idx in cfg.mainline_green_phases:
+            return "green"
+        if phase_idx in cfg.mainline_yellow_phases:
+            return "yellow"
+        return "red"
 
     def _mean_corridor_speed(self) -> float:
         speed_sum = 0.0
@@ -301,36 +367,78 @@ class CavSpeedEnv:
         half_range = (cfg.action_high - cfg.action_low) / 2.0
         return cfg.action_low + (actions + 1.0) * half_range
 
+    def _lane_speed_limit(self, lane_id: str) -> float:
+        limit = self.config.action_high
+        if self._conn is not None:
+            try:
+                limit = self._conn.lane.getMaxSpeed(lane_id)
+            except traci.TraCIException:
+                limit = self.config.action_high
+        return limit * self.config.speed_limit_scale
+
+    def _stopline_speed_profile(self, base_target: float, distance_to_stop: float, phase_color: str) -> float:
+        cfg = self.config
+        if phase_color == "green":
+            return max(0.0, min(base_target, cfg.action_high))
+        if phase_color == "yellow":
+            buffer = max(cfg.stopline_buffer_yellow, 1.0)
+            cap = cfg.yellow_phase_speed_cap
+        else:
+            buffer = max(cfg.stopline_buffer, 1.0)
+            cap = cfg.red_phase_speed_cap
+        scaled_cap = cap
+        if distance_to_stop <= buffer:
+            scaled_cap = cap * max(distance_to_stop / buffer, 0.0)
+        return max(0.0, min(base_target, scaled_cap))
+
     def _apply_speed_commands(self, lane_targets: np.ndarray) -> np.ndarray:
         cfg = self.config
         applied = np.zeros_like(lane_targets)
         self._prev_speed_targets = self._lane_target_speeds.copy()
         phase_idx = self._current_phase_index()
-        if phase_idx in cfg.mainline_green_phases:
+        phase_color = self._phase_category(phase_idx)
+        if phase_color == "green":
             phase_scale = cfg.phase_speed_scale_green
-        elif phase_idx in cfg.mainline_yellow_phases:
+        elif phase_color == "yellow":
             phase_scale = cfg.phase_speed_scale_yellow
         else:
             phase_scale = cfg.phase_speed_scale_red
         phase_scale = float(np.clip(phase_scale, 0.0, 1.0))
         phase_high = cfg.action_low + (cfg.action_high - cfg.action_low) * phase_scale
         phase_high = max(cfg.action_low, phase_high)
+        self._last_phase_color = phase_color
         for lane_idx, lane_id in enumerate(cfg.controlled_lanes):
-            desired = float(np.clip(lane_targets[lane_idx], cfg.action_low, phase_high))
+            lane_cap = min(phase_high, self._lane_speed_limit(lane_id))
+            desired = float(np.clip(lane_targets[lane_idx], cfg.action_low, lane_cap))
             last = self._lane_target_speeds[lane_idx]
             max_delta = max(cfg.max_speed_delta, 1e-3)
             limited = float(np.clip(desired, last - max_delta, last + max_delta))
+            limited = min(limited, lane_cap)
             self._lane_target_speeds[lane_idx] = limited
             applied[lane_idx] = limited
             vehicles = self._conn.lane.getLastStepVehicleIDs(lane_id)
             for vid in vehicles:
                 if not self._is_cav(vid):
                     continue
-                if self._conn.vehicle.getLaneIndex(vid) != 1:
-                    # Ensure we only touch the straight-through lane.
+                try:
+                    lane_index = self._conn.vehicle.getLaneIndex(vid)
+                except traci.TraCIException:
                     continue
-                self._conn.vehicle.setSpeedMode(vid, 0b00000)
-                self._conn.vehicle.setSpeed(vid, limited)
+                if lane_index != 1:
+                    continue
+                try:
+                    lane_pos = self._conn.vehicle.getLanePosition(vid)
+                except traci.TraCIException:
+                    lane_pos = 0.0
+                lane_length = self._lane_lengths.get(lane_id, 0.0)
+                distance_to_stop = max(lane_length - lane_pos, 0.0)
+                vehicle_target = self._stopline_speed_profile(limited, distance_to_stop, phase_color)
+                vehicle_target = min(vehicle_target, lane_cap)
+                try:
+                    self._conn.vehicle.setSpeedMode(vid, cfg.cav_speed_mode)
+                    self._conn.vehicle.setSpeed(vid, vehicle_target)
+                except traci.TraCIException:
+                    continue
         return applied
 
     # ---------------------------- reward logic -----------------------------
@@ -338,61 +446,120 @@ class CavSpeedEnv:
     def _compute_reward(self, frame: np.ndarray) -> Tuple[float, Dict[str, float]]:
         cfg = self.config
         weights = cfg.reward_weights
-        energy = self._estimate_energy_usage()
-        halting = self._total_halting()
-        wait = self._total_waiting_time()
+        (
+            avg_power_kw,
+            avg_energy_kwh,
+            total_energy_kwh,
+            cav_count,
+        ) = self._estimate_energy_usage()
+        self._cumulative_energy_kwh += total_energy_kwh
+        cav_queue, total_queue = self._total_halting()
+        cav_wait, total_wait = self._total_waiting_time()
+        hdv_wait = max(total_wait - cav_wait, 0.0)
+        self._cumulative_queue_all += total_queue
+        self._cumulative_wait_all += total_wait
         arrived_total = self._conn.simulation.getArrivedNumber()
         arrived_delta = max(arrived_total - self._last_arrived, 0)
         self._last_arrived = arrived_total
-        queue_ratio = min(halting / max(self._max_queue_capacity, 1.0), 1.0)
-        energy_norm = min(energy / max(cfg.energy_normalizer, 1e-3), 1.0)
-        wait_norm = min(wait / max(cfg.corridor_wait_normalizer, 1.0), 1.0)
+        capacity = max(self._max_queue_capacity, 1.0)
+        queue_ratio = min(total_queue / capacity, 1.0)
+        queue_ratio_cav = min(cav_queue / capacity, 1.0)
+        energy_norm = min(avg_power_kw / max(cfg.energy_normalizer, 1e-3), 1.0)
+        cumulative_energy_norm = min(
+            self._cumulative_energy_kwh
+            / max(cfg.energy_normalizer * max(self._step + 1, 1) * cfg.step_length / 3600.0, 1e-3),
+            1.0,
+        )
+        wait_norm = min(cav_wait / max(cfg.corridor_wait_normalizer, 1.0), 1.0)
+        hdv_wait_norm = min(hdv_wait / max(cfg.corridor_wait_normalizer, 1.0), 1.0)
         throughput_norm = min(arrived_delta / max(cfg.throughput_normalizer, 1.0), 1.0)
         speed_delta = (self._lane_target_speeds - self._prev_speed_targets) / max(cfg.max_speed_delta, 1e-3)
         smooth = float(np.mean(np.square(speed_delta)))
-        phase_idx = self._current_phase_index()
-        is_green = phase_idx in cfg.mainline_green_phases
-        is_yellow = phase_idx in cfg.mainline_yellow_phases
-        red_queue_ratio = queue_ratio if (not is_green and not is_yellow) else 0.0
+        _, phase_progress, phase_idx, _ = self._phase_features()
+        phase_color = self._phase_category(phase_idx)
+        is_green = phase_color == "green"
+        is_yellow = phase_color == "yellow"
+        throughput_green = throughput_norm if is_green else 0.0
+        green_window = 0.0
+        if is_green and phase_progress <= cfg.green_wave_window:
+            green_window = (1.0 - queue_ratio) * throughput_norm
+        phase_penalty_term = queue_ratio
+        if is_green:
+            phase_penalty_term *= (1.0 - phase_progress)
+        elif is_yellow:
+            phase_penalty_term *= 0.8
+        else:
+            phase_penalty_term *= 1.2
+        red_queue_ratio = queue_ratio if phase_color == "red" else 0.0
 
         reward = (
             -weights.energy * energy_norm
+            -0.5 * weights.energy * cumulative_energy_norm
             -weights.queue * queue_ratio
             -weights.wait * wait_norm
+            -weights.hdv_wait * hdv_wait_norm
             -weights.smooth * smooth
-            +weights.throughput * throughput_norm
-            -0.3 * red_queue_ratio
+            +weights.throughput * throughput_green
+            +weights.green_wave * green_window
+            -weights.phase_penalty * phase_penalty_term
         )
         terms = {
-            "energy": energy,
+            "energy": avg_power_kw,
             "energy_norm": energy_norm,
-            "queue": float(halting),
+            "energy_kwh_step": avg_energy_kwh,
+            "energy_kwh_total": total_energy_kwh,
+            "energy_cum_norm": cumulative_energy_norm,
+            "queue": float(total_queue),
             "queue_ratio": float(queue_ratio),
-            "wait_time": float(wait),
+            "queue_cav": float(cav_queue),
+            "queue_ratio_cav": float(queue_ratio_cav),
+            "wait_time": float(cav_wait),
             "wait_norm": wait_norm,
+            "wait_all": float(total_wait),
+            "wait_hdv": float(hdv_wait),
+            "wait_hdv_norm": hdv_wait_norm,
             "smooth": smooth,
             "throughput": float(arrived_delta),
             "throughput_norm": throughput_norm,
+            "throughput_green": throughput_green,
+            "green_window_reward": green_window,
+            "phase_penalty_term": phase_penalty_term,
             "red_queue_ratio": float(red_queue_ratio),
+            "phase_color": phase_color,
+            "cumulative_energy_kwh": self._cumulative_energy_kwh,
+            "cumulative_queue": self._cumulative_queue_all,
+            "cumulative_wait": self._cumulative_wait_all,
             "reward": reward,
         }
-        self._last_energy = energy
+        self._last_energy = avg_power_kw
         return reward, terms
 
-    def _estimate_energy_usage(self) -> float:
-        total_energy = 0.0
+    def _estimate_energy_usage(self) -> Tuple[float, float, float, int]:
+        total_power = 0.0
+        total_energy_kwh = 0.0
         cav_count = 0
+        step_hours = self.config.step_length / 3600.0
         for lane_id in self.config.controlled_lanes:
             for vid in self._conn.lane.getLastStepVehicleIDs(lane_id):
                 if not self._is_cav(vid):
                     continue
                 cav_count += 1
-                v = max(self._conn.vehicle.getSpeed(vid), 0.0)
-                a = self._conn.vehicle.getAcceleration(vid)
-                total_energy += self._longitudinal_power(v, a)
+                try:
+                    v = max(self._conn.vehicle.getSpeed(vid), 0.0)
+                except traci.TraCIException:
+                    v = 0.0
+                try:
+                    a = self._conn.vehicle.getAcceleration(vid)
+                except traci.TraCIException:
+                    a = 0.0
+                power_kw = self._longitudinal_power(v, a)
+                total_power += power_kw
+                total_energy_kwh += power_kw * step_hours
         if cav_count == 0:
-            return 0.0
-        return total_energy / cav_count
+            return 0.0, 0.0, 0.0, 0
+        avg_power = total_power / cav_count
+        avg_energy = total_energy_kwh / cav_count
+        return avg_power, avg_energy, total_energy_kwh, cav_count
 
     @staticmethod
     def _longitudinal_power(speed: float, acceleration: float) -> float:
@@ -406,28 +573,44 @@ class CavSpeedEnv:
         aero = 0.5 * rho * drag_coeff * frontal_area * speed ** 3
         inertial = mass * speed * acceleration
         power = rolling + aero + max(inertial, 0.0)
-        return max(power, 0.0) * 0.001  # scale kW for reward stability
+        return max(power, 0.0) * 0.001  # kW
 
-    def _total_halting(self) -> int:
-        halt = 0
+    def _total_halting(self) -> Tuple[int, int]:
+        cav_total = 0
+        all_total = 0
         for lane_id in self.config.controlled_lanes:
-            halt += self._count_halting(self._conn.lane.getLastStepVehicleIDs(lane_id))
-        return halt
+            cav_lane, all_lane = self._count_halting(self._conn.lane.getLastStepVehicleIDs(lane_id))
+            cav_total += cav_lane
+            all_total += all_lane
+        return cav_total, all_total
 
-    def _count_halting(self, vehicles: Iterable[str]) -> int:
+    def _count_halting(self, vehicles: Iterable[str]) -> Tuple[int, int]:
+        cav = 0
         total = 0
         for vid in vehicles:
-            if self._conn.vehicle.getSpeed(vid) < 0.1:
+            try:
+                speed = self._conn.vehicle.getSpeed(vid)
+            except traci.TraCIException:
+                speed = 0.0
+            if speed < 0.1:
                 total += 1
-        return total
+                if self._is_cav(vid):
+                    cav += 1
+        return cav, total
 
-    def _total_waiting_time(self) -> float:
-        wait = 0.0
+    def _total_waiting_time(self) -> Tuple[float, float]:
+        cav_wait = 0.0
+        total_wait = 0.0
         for lane_id in self.config.controlled_lanes:
             for vid in self._conn.lane.getLastStepVehicleIDs(lane_id):
+                try:
+                    wait = self._conn.vehicle.getWaitingTime(vid)
+                except traci.TraCIException:
+                    wait = 0.0
+                total_wait += wait
                 if self._is_cav(vid):
-                    wait += self._conn.vehicle.getWaitingTime(vid)
-        return wait
+                    cav_wait += wait
+        return cav_wait, total_wait
 
     def _is_cav(self, vehicle_id: str) -> bool:
         try:

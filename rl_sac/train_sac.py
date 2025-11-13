@@ -11,7 +11,7 @@ import torch
 
 from dataclasses import replace
 
-from rl_sac.config import TrainConfig
+from rl_sac.config import EnvConfig, TrainConfig
 from rl_sac.replay_buffer import ReplayBuffer
 from rl_sac.sac_agent import SACAgent
 from rl_sac.sumo_env import CavSpeedEnv
@@ -45,17 +45,53 @@ def maybe_override_config(base: TrainConfig, override_path: str | None) -> Train
     return base
 
 
+def stage_env_config(env_cfg: EnvConfig, stage: str, port_offset: int = 0) -> EnvConfig:
+    cfg = replace(env_cfg)
+    if port_offset:
+        cfg.port = env_cfg.port + port_offset
+    if cfg.sumo_output_root:
+        root = Path(cfg.sumo_output_root)
+        stage_root = root / stage
+        cfg.queue_output_dir = stage_root / "queue"
+        cfg.tripinfo_output_dir = stage_root / "tripinfo"
+        cfg.fcd_output_dir = stage_root / "fcd"
+        cfg.summary_output_dir = stage_root / "summary"
+    return cfg
+
+
 def evaluate(agent: SACAgent, env: CavSpeedEnv, episodes: int = 3) -> Dict[str, float]:
-    metrics: Dict[str, float] = {"reward": 0.0}
+    metrics: Dict[str, float] = {
+        "reward": 0.0,
+        "energy_kwh": 0.0,
+        "queue": 0.0,
+        "wait_all": 0.0,
+        "queue_ratio": 0.0,
+    }
     for ep in range(episodes):
         obs = env.reset()
         done = False
         ep_reward = 0.0
+        energy_kwh_sum = 0.0
+        queue_sum = 0.0
+        queue_ratio_sum = 0.0
+        wait_all_sum = 0.0
+        step_count = 0
         while not done:
             action = agent.select_action(obs, deterministic=True).numpy()
-            obs, reward, done, _ = env.step(action)
+            obs, reward, done, info = env.step(action)
             ep_reward += reward
+            step_count += 1
+            energy_kwh_sum += info.get("energy_kwh_step", 0.0)
+            queue_sum += info.get("queue", 0.0)
+            queue_ratio_sum += info.get("queue_ratio", 0.0)
+            wait_all_sum += info.get("wait_all", 0.0)
         metrics["reward"] += ep_reward
+        if step_count:
+            inv_steps = 1.0 / step_count
+            metrics["energy_kwh"] += energy_kwh_sum * inv_steps
+            metrics["queue"] += queue_sum * inv_steps
+            metrics["queue_ratio"] += queue_ratio_sum * inv_steps
+            metrics["wait_all"] += wait_all_sum * inv_steps
     metrics = {k: v / episodes for k, v in metrics.items()}
     return metrics
 
@@ -65,8 +101,10 @@ def train() -> None:
     config = maybe_override_config(TrainConfig(), args.config)
     if args.episodes:
         config.total_episodes = args.episodes
-    env = CavSpeedEnv(config.env, use_gui=args.gui)
-    eval_env = CavSpeedEnv(replace(config.env, port=config.env.port + 1), use_gui=False)
+    train_env_cfg = stage_env_config(config.env, "train", port_offset=0)
+    eval_env_cfg = stage_env_config(config.env, "eval", port_offset=1)
+    env = CavSpeedEnv(train_env_cfg, use_gui=args.gui)
+    eval_env = CavSpeedEnv(eval_env_cfg, use_gui=False)
     obs_dim = env.observation_dim
     act_dim = env.action_dim
     device = torch.device(args.device) if args.device else None
@@ -75,8 +113,9 @@ def train() -> None:
         obs_dim,
         act_dim,
         config.sac.replay_capacity,
-        num_phase_bins=config.env.phase_bins,
+        num_phase_bins=train_env_cfg.phase_balance_bins,
         balance_by_phase=config.sac.phase_balanced_replay,
+        normalize_rewards=config.sac.normalize_rewards,
     )
     metrics_dir = config.run_dir / "train"
     metrics_dir.mkdir(parents=True, exist_ok=True)
@@ -89,12 +128,22 @@ def train() -> None:
         "episode_reward",
         "running_avg_reward",
         "eval_reward",
+        "eval_energy_kwh",
+        "eval_queue",
+        "eval_wait_all",
         "mean_energy",
         "mean_energy_norm",
+        "mean_energy_kwh",
         "mean_queue",
         "mean_queue_ratio",
+         "mean_queue_cav_ratio",
         "mean_wait_norm",
+         "mean_wait_all",
+         "mean_wait_hdv",
         "mean_throughput_norm",
+         "mean_throughput_green",
+         "mean_green_window",
+         "mean_phase_penalty",
         "mean_red_queue_ratio",
         "q1_loss",
         "actor_loss",
@@ -107,6 +156,7 @@ def train() -> None:
     global_step = 0
     best_eval = -float("inf")
     last_eval_reward = 0.0
+    last_eval_stats: Dict[str, float] = {"energy_kwh": 0.0, "queue": 0.0, "wait_all": 0.0}
     try:
         for episode in range(1, config.total_episodes + 1):
             obs = env.reset(seed=config.env.seed + episode)
@@ -114,10 +164,17 @@ def train() -> None:
             info: Dict[str, float] = {}
             energy_norm_sum = 0.0
             energy_raw_sum = 0.0
+            energy_kwh_sum = 0.0
             queue_ratio_sum = 0.0
             queue_raw_sum = 0.0
+            queue_cav_ratio_sum = 0.0
             throughput_norm_sum = 0.0
+            throughput_green_sum = 0.0
             wait_norm_sum = 0.0
+            wait_all_sum = 0.0
+            wait_hdv_sum = 0.0
+            green_window_sum = 0.0
+            phase_penalty_sum = 0.0
             red_queue_ratio_sum = 0.0
             step_count = 0
             for t in range(config.max_episode_steps):
@@ -132,7 +189,7 @@ def train() -> None:
                     reward,
                     next_obs,
                     done,
-                    phase_id=int(info.get("phase_bin", -1)),
+                    phase_id=int(info.get("phase_color_id", -1)),
                 )
                 obs = next_obs
                 episode_reward += reward
@@ -140,10 +197,17 @@ def train() -> None:
                 step_count += 1
                 energy_norm_sum += info.get("energy_norm", 0.0)
                 energy_raw_sum += info.get("energy", 0.0)
+                energy_kwh_sum += info.get("energy_kwh_step", 0.0)
                 queue_ratio_sum += info.get("queue_ratio", 0.0)
                 queue_raw_sum += info.get("queue", 0.0)
+                queue_cav_ratio_sum += info.get("queue_ratio_cav", 0.0)
                 throughput_norm_sum += info.get("throughput_norm", 0.0)
+                throughput_green_sum += info.get("throughput_green", 0.0)
                 wait_norm_sum += info.get("wait_norm", 0.0)
+                wait_all_sum += info.get("wait_all", 0.0)
+                wait_hdv_sum += info.get("wait_hdv", 0.0)
+                green_window_sum += info.get("green_window_reward", 0.0)
+                phase_penalty_sum += info.get("phase_penalty_term", 0.0)
                 red_queue_ratio_sum += info.get("red_queue_ratio", 0.0)
 
                 if global_step >= config.sac.update_after and global_step % config.sac.update_every == 0:
@@ -156,32 +220,57 @@ def train() -> None:
 
             mean_energy = 0.0
             mean_energy_norm = 0.0
+            mean_energy_kwh = 0.0
             mean_queue = 0.0
             mean_queue_ratio = 0.0
+            mean_queue_cav_ratio = 0.0
             mean_throughput_norm = 0.0
+            mean_throughput_green = 0.0
             mean_wait_norm = 0.0
+            mean_wait_all = 0.0
+            mean_wait_hdv = 0.0
+            mean_green_window = 0.0
+            mean_phase_penalty = 0.0
             mean_red_queue_ratio = 0.0
             if step_count:
                 inv_steps = 1.0 / step_count
                 mean_energy = energy_raw_sum * inv_steps
                 mean_energy_norm = energy_norm_sum * inv_steps
+                mean_energy_kwh = energy_kwh_sum * inv_steps
                 mean_queue = queue_raw_sum * inv_steps
                 mean_queue_ratio = queue_ratio_sum * inv_steps
+                mean_queue_cav_ratio = queue_cav_ratio_sum * inv_steps
                 mean_throughput_norm = throughput_norm_sum * inv_steps
+                mean_throughput_green = throughput_green_sum * inv_steps
                 mean_wait_norm = wait_norm_sum * inv_steps
+                mean_wait_all = wait_all_sum * inv_steps
+                mean_wait_hdv = wait_hdv_sum * inv_steps
+                mean_green_window = green_window_sum * inv_steps
+                mean_phase_penalty = phase_penalty_sum * inv_steps
                 mean_red_queue_ratio = red_queue_ratio_sum * inv_steps
                 logger.log("energy", mean_energy)
                 logger.log("energy_norm", mean_energy_norm)
+                logger.log("energy_kwh", mean_energy_kwh)
                 logger.log("queue", mean_queue)
                 logger.log("queue_ratio", mean_queue_ratio)
+                logger.log("queue_cav_ratio", mean_queue_cav_ratio)
                 logger.log("throughput_norm", mean_throughput_norm)
+                logger.log("throughput_green", mean_throughput_green)
                 logger.log("wait_norm", mean_wait_norm)
+                logger.log("wait_all", mean_wait_all)
+                logger.log("wait_hdv", mean_wait_hdv)
+                logger.log("green_window", mean_green_window)
+                logger.log("phase_penalty", mean_phase_penalty)
                 logger.log("red_queue_ratio", mean_red_queue_ratio)
             logger.log("episode_reward", episode_reward)
             if episode % config.eval_interval == 0:
                 eval_stats = evaluate(agent, eval_env, episodes=2)
                 last_eval_reward = eval_stats["reward"]
                 logger.log("eval_reward", last_eval_reward)
+                logger.log("eval_energy_kwh", eval_stats.get("energy_kwh", 0.0))
+                logger.log("eval_queue", eval_stats.get("queue", 0.0))
+                logger.log("eval_wait_all", eval_stats.get("wait_all", 0.0))
+                last_eval_stats = eval_stats
                 if last_eval_reward > best_eval:
                     best_eval = last_eval_reward
                     agent.save(config.model_dir / "best.pt")
@@ -196,12 +285,22 @@ def train() -> None:
                     "episode_reward": episode_reward,
                     "running_avg_reward": summary.get("episode_reward", 0.0),
                     "eval_reward": last_eval_reward,
+                    "eval_energy_kwh": last_eval_stats.get("energy_kwh", 0.0),
+                    "eval_queue": last_eval_stats.get("queue", 0.0),
+                    "eval_wait_all": last_eval_stats.get("wait_all", 0.0),
                     "mean_energy": mean_energy,
                     "mean_energy_norm": mean_energy_norm,
+                    "mean_energy_kwh": mean_energy_kwh,
                     "mean_queue": mean_queue,
                     "mean_queue_ratio": mean_queue_ratio,
+                    "mean_queue_cav_ratio": mean_queue_cav_ratio,
                     "mean_wait_norm": mean_wait_norm,
+                    "mean_wait_all": mean_wait_all,
+                    "mean_wait_hdv": mean_wait_hdv,
                     "mean_throughput_norm": mean_throughput_norm,
+                    "mean_throughput_green": mean_throughput_green,
+                    "mean_green_window": mean_green_window,
+                    "mean_phase_penalty": mean_phase_penalty,
                     "mean_red_queue_ratio": mean_red_queue_ratio,
                     "q1_loss": summary.get("q1_loss", 0.0),
                     "actor_loss": summary.get("actor_loss", 0.0),
@@ -213,7 +312,8 @@ def train() -> None:
             if episode % config.print_interval == 0:
                 print(
                     "Episode {}/{} | step_reward={:.3f} | avg_reward={:.3f} | eval={:.3f} | "
-                    "energy_norm={:.3f} | queue_ratio={:.3f} | q1={:.4f} | actor={:.4f} | alpha={:.4f}".format(
+                    "energy_norm={:.3f} | queue_ratio={:.3f} | wait_norm={:.3f} | kWh={:.3f} | "
+                    "q1={:.4f} | actor={:.4f} | alpha={:.4f}".format(
                         episode,
                         config.total_episodes,
                         episode_reward,
@@ -221,6 +321,8 @@ def train() -> None:
                         summary.get("eval_reward", 0.0),
                         summary.get("energy_norm", 0.0),
                         summary.get("queue_ratio", 0.0),
+                        summary.get("wait_norm", 0.0),
+                        summary.get("energy_kwh", 0.0),
                         summary.get("q1_loss", 0.0),
                         summary.get("actor_loss", 0.0),
                         summary.get("alpha", 0.0),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict
 
@@ -24,6 +25,7 @@ class ReplayBuffer:
         capacity: int,
         num_phase_bins: int | None = None,
         balance_by_phase: bool = False,
+        normalize_rewards: bool = False,
     ) -> None:
         self.capacity = capacity
         self.obs_buf = np.zeros((capacity, obs_dim), dtype=np.float32)
@@ -36,6 +38,8 @@ class ReplayBuffer:
         self.size = 0
         self.num_phase_bins = num_phase_bins if balance_by_phase and num_phase_bins else None
         self.balance_by_phase = balance_by_phase and self.num_phase_bins is not None
+        self.normalize_rewards = normalize_rewards
+        self._reward_rms = RunningMeanStd() if normalize_rewards else None
 
     def push(
         self,
@@ -52,8 +56,10 @@ class ReplayBuffer:
         self.act_buf[idx] = act
         self.rew_buf[idx] = rew
         self.done_buf[idx] = float(done)
+        if self._reward_rms is not None:
+            self._reward_rms.update(float(rew))
         if self.balance_by_phase:
-            if phase_id is None:
+            if phase_id is None or phase_id < 0:
                 phase_idx = -1
             else:
                 phase_idx = int(phase_id) % max(self.num_phase_bins or 1, 1)
@@ -68,6 +74,11 @@ class ReplayBuffer:
         obs = torch.as_tensor(self.obs_buf[idxs], device=device)
         act = torch.as_tensor(self.act_buf[idxs], device=device)
         rew = torch.as_tensor(self.rew_buf[idxs], device=device)
+        if self._reward_rms is not None:
+            std = self._reward_rms.std
+            mean = self._reward_rms.mean
+            if std > 1e-6:
+                rew = torch.clamp((rew - mean) / std, -5.0, 5.0)
         next_obs = torch.as_tensor(self.next_obs_buf[idxs], device=device)
         done = torch.as_tensor(self.done_buf[idxs], device=device)
         return TransitionBatch(obs, act, rew, next_obs, done)
@@ -115,6 +126,26 @@ class ReplayBuffer:
         self.size = int(state["size"][0])
         if "phase_ids" in state:
             self.phase_ids = state["phase_ids"]
+
+
+class RunningMeanStd:
+    def __init__(self) -> None:
+        self.mean = 0.0
+        self._m2 = 0.0
+        self.count = 0
+
+    def update(self, value: float) -> None:
+        self.count += 1
+        delta = value - self.mean
+        self.mean += delta / self.count
+        delta2 = value - self.mean
+        self._m2 += delta * delta2
+
+    @property
+    def std(self) -> float:
+        if self.count < 2:
+            return 1.0
+        return math.sqrt(max(self._m2 / (self.count - 1), 1e-6))
 
 
 __all__ = ["ReplayBuffer", "TransitionBatch"]
