@@ -1,0 +1,15 @@
+<configuration>
+    <input>
+        <net-file value="grid1x3.net.xml"/>
+        <route-files value="grid1x3.pen30.rou.xml"/>
+    </input>
+    <time>
+        <begin value="0"/>
+        <end value="3600"/>
+        <step-length value="1.0"/>
+    </time>
+    <report>
+        <no-step-log value="true"/>
+        <verbose value="false"/>
+    </report>
+</configuration>

@@ -1,0 +1,11 @@
+<?xml version='1.0' encoding='utf-8'?>
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+    <vType id="hdv" accel="2.6" decel="4.5" sigma="0.5" length="5.0" minGap="2.5" speedDev="0.1" tau="1.0" carFollowModel="Krauss" color="255,255,0" maxSpeed="15" laneChangeModel="LC2013" />
+    <vType id="cav" accel="3.0" decel="5.0" sigma="0.1" length="4.5" minGap="1.0" speedDev="0.05" tau="1.0" carFollowModel="IDM" color="255,0,0" maxSpeed="15" laneChangeModel="LC2013" />
+    <!--Mainline straight-through traffic (controlled lane)-->
+    <route id="route_west_straight" edges="W_J0 J0_J1 J1_J2 J2_E" />
+    <flow id="flow_west_straight_hdv" type="hdv" route="route_west_straight" begin="0" end="3600" departLane="1" departSpeed="desired" departPos="base" vehsPerHour="500.00" />
+    <!--Eastbound straight-through traffic (controlled lane)-->
+    <route id="route_east_straight" edges="E_J2 J2_J1 J1_J0 J0_W" />
+    <flow id="flow_east_straight_hdv" type="hdv" route="route_east_straight" begin="0" end="3600" departLane="1" departSpeed="desired" departPos="base" vehsPerHour="500.00" />
+</routes>
